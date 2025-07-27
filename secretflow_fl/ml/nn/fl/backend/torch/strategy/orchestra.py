@@ -1,3 +1,17 @@
+# Copyright wawahejun, hejunlbbc@gmail.com
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """
 Orchestra Strategy for Unsupervised Federated Learning
 
@@ -291,16 +305,21 @@ class OrchestraStrategy(BaseTorchModel):
         """
         Reset projection memory following the original paper 
         """
-        self.train()
+        self.backbone.train()
+        self.projector.train()
+        self.target_backbone.train()
+        self.target_projector.train()
         
-        # Save BN parameters 
+        # Save BN parameters from backbone and projector
         reset_dict = OrderedDict()
-        for k, v in self.state_dict().items():
-            if 'bn' in k:
-                if v.shape == ():
-                    reset_dict[k] = torch.tensor(np.array([v.cpu().numpy()]))
-                else:
-                    reset_dict[k] = v.cpu().clone()  
+        for name, module in [('backbone', self.backbone), ('projector', self.projector)]:
+            for k, v in module.state_dict().items():
+                if 'bn' in k:
+                    full_key = f'{name}.{k}'
+                    if v.shape == ():
+                        reset_dict[full_key] = torch.tensor(np.array([v.cpu().numpy()]))
+                    else:
+                        reset_dict[full_key] = v.cpu().clone()  
         
         # Generate feature bank with memory optimization
         proj_bank = []
@@ -338,13 +357,17 @@ class OrchestraStrategy(BaseTorchModel):
             if n_samples > self.memory_size:
                 proj_bank = proj_bank[:self.memory_size]
             
-            # Save projections: [D, memory_size]
+            # Save projections: mem_projections weight shape is (projection_dim, memory_size)
+            # proj_bank shape is (memory_size, projection_dim), so we need transpose
             self.mem_projections.weight.data.copy_(proj_bank.T.to(device))
             
             del proj_bank
         
         # Reset BN parameters
-        self.load_state_dict(reset_dict, strict=False)
+        for name, module in [('backbone', self.backbone), ('projector', self.projector)]:
+            module_dict = {k.replace(f'{name}.', ''): v for k, v in reset_dict.items() if k.startswith(f'{name}.')}
+            if module_dict:
+                module.load_state_dict(module_dict, strict=False)
         
         del reset_dict
         
@@ -376,7 +399,8 @@ class OrchestraStrategy(BaseTorchModel):
         Perform local clustering following the original paper 
         """
         with torch.no_grad():
-            # Get memory projections: [memory_size, D] 
+            # Get memory projections: mem_projections.weight shape is (projection_dim, memory_size)
+            # We need (memory_size, projection_dim) for clustering
             Z = self.mem_projections.weight.data.T
             
             # Initialize centroids randomly
@@ -431,8 +455,8 @@ class OrchestraStrategy(BaseTorchModel):
         if not hasattr(self, '_global_centroids_initialized'):
             with torch.no_grad():
                 indices = np.random.choice(N, min(self.N_global, N), replace=False)
-                init_centroids = aggregated_features[indices]
-                self.centroids.weight.data.copy_(init_centroids.T)
+                init_centroids = aggregated_features[indices]  # Shape: (N_global, projection_dim)
+                self.centroids.weight.data.copy_(init_centroids)  # No transpose needed
                 self._global_centroids_initialized = True
         
         # Setup optimizer for global clustering
@@ -945,6 +969,84 @@ class OrchestraStrategy(BaseTorchModel):
                 )
             else:
                 raise ValueError(f"Unknown feature_type: {feature_type}. Use 'backbone', 'projection', or 'both'")
+    
+    def evaluate(self, evaluate_steps=0):
+        """
+        Override evaluate method for Orchestra strategy
+        
+        Since Orchestra modifies the backbone to remove classification layers,
+        we need a custom evaluation that uses the original classifier.
+        """
+        assert evaluate_steps > 0, "Evaluate_steps must greater than 0"
+        assert self.model is not None, "Model cannot be none, please give model define"
+        assert (
+            len(self.model.metrics) > 0
+        ), "Metric cannot be none, please give metric by 'TorchModel'"
+        
+        # Set models to evaluation mode
+        self.backbone.eval()
+        if hasattr(self, 'original_fc'):
+            self.original_fc.eval()
+        elif hasattr(self, 'original_classifier'):
+            self.original_classifier.eval()
+        
+        # reset all metrics
+        self.eval_iter = iter(self.eval_set)
+        self.reset_metrics()
+        
+        with torch.no_grad():
+            for step in range(evaluate_steps):
+                x, y, s_w = self.next_batch(stage="eval")
+                
+                # Forward pass through backbone
+                features = self.backbone(x)
+                
+                # Apply original classifier if available
+                if hasattr(self, 'original_fc'):
+                    y_pred = self.original_fc(features)
+                elif hasattr(self, 'original_classifier'):
+                    y_pred = self.original_classifier(features)
+                else:
+                    # Fallback: use a simple linear layer for evaluation
+                    if not hasattr(self, 'eval_classifier'):
+                        feature_dim = features.shape[-1]
+                        num_classes = y.shape[-1] if len(y.shape) > 1 else int(y.max().item()) + 1
+                        self.eval_classifier = nn.Linear(feature_dim, num_classes)
+                        device = self.exe_device if hasattr(self, 'exe_device') else torch.device('cpu')
+                        self.eval_classifier = self.eval_classifier.to(device)
+                        self.logger.warning(f"Created temporary classifier for evaluation: {feature_dim} -> {num_classes}")
+                    y_pred = self.eval_classifier(features)
+                
+                # Update metrics using the model's validation_step
+                # We need to temporarily restore the classifier for metric computation
+                if hasattr(self, 'original_fc'):
+                    original_fc = self.backbone.fc
+                    self.backbone.fc = self.original_fc
+                    self.model.validation_step((x, y), step, sample_weight=s_w)
+                    self.backbone.fc = original_fc
+                elif hasattr(self, 'original_classifier'):
+                    original_classifier = self.backbone.classifier
+                    self.backbone.classifier = self.original_classifier
+                    self.model.validation_step((x, y), step, sample_weight=s_w)
+                    self.backbone.classifier = original_classifier
+                else:
+                    # Manual metric update for fallback case
+                    for metric in self.model.metrics:
+                        metric.update(y_pred, y)
+            
+            result = {}
+            self.transform_metrics(result, stage="eval")
+        
+        if self.logs is None:
+            self.wrapped_metrics.extend(self.wrap_local_metrics())
+            return self.wrap_local_metrics()
+        else:
+            val_result = {}
+            for k, v in result.items():
+                val_result[f"val_{k}"] = v
+            self.logs.update(val_result)
+            self.wrapped_metrics.extend(self.wrap_local_metrics(stage="val"))
+            return self.wrap_local_metrics(stage="val")
 
 
 # PYU wrapper classes for SecretFlow compatibility
