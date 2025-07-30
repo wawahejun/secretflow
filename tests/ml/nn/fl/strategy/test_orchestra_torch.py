@@ -32,7 +32,7 @@ from secretflow_fl.ml.nn.core.torch import (
 )
 from secretflow_fl.ml.nn.fl.backend.torch.strategy.orchestra import OrchestraStrategy
 from secretflow.security import SecureAggregator
-from tests.ml.nn.fl.model_def import ConvNet
+from secretflow.tests.ml.nn.fl.model_def import ConvNet
 
 
 class OrchestraConvNet(BaseModule):
